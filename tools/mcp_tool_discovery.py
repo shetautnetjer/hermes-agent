@@ -455,11 +455,14 @@ async def _discover_all(new_servers: dict[str, dict]) -> None:
         return_exceptions=True)
     for name, result in zip(new_servers, results):
         if isinstance(result, BaseException):
+            from tools.mcp_oauth import OAuthNonInteractiveError
             command = new_servers.get(name, {}).get("command")
             message = _note_connect_failure(name, result)
-            logger.warning("Failed to connect to MCP server '%s'%s: %s%s",
-                           name, f" (command={command})" if command else "", message,
-                           _stderr_tail_note(name))
+            # A missing OAuth login already logged its one WARNING: the park line with the remedy.
+            (logger.debug if isinstance(result, OAuthNonInteractiveError) else logger.warning)(
+                "Failed to connect to MCP server '%s'%s: %s%s",
+                name, f" (command={command})" if command else "", message,
+                _stderr_tail_note(name))
         else:
             _note_connect_success(name)
 

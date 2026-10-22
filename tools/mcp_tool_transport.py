@@ -526,7 +526,10 @@ class MCPServerTransportMixin:
             from tools.mcp_oauth_manager import get_manager
             return get_manager().get_or_build_provider(self.name, url, config.get("oauth"))
         except Exception as exc:
-            logger.warning("MCP OAuth setup failed for '%s': %s", self.name, exc)
+            from tools.mcp_oauth import OAuthNonInteractiveError
+            # A missing login is reported once, by the park WARNING (state + `hermes mcp login`).
+            (logger.debug if isinstance(exc, OAuthNonInteractiveError) else logger.warning)(
+                "MCP OAuth setup failed for '%s': %s", self.name, exc)
             raise
 
     def _sse_transport(self, url: str, headers: dict, connect_timeout: float,
