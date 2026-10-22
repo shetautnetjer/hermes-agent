@@ -222,6 +222,12 @@ class MCPServerRunMixin:
                     "self-probe until it is re-enabled", self.name)
                 paused = True
                 continue
+            # A tokenless OAuth server can only fail the same way until a login writes its token
+            # file: the manager refuses a non-interactive flow without cached tokens, so each timed
+            # probe re-ran that refusal and re-logged it every interval for the life of the process.
+            # An explicit reconnect still revives at once; a token-holding auth park is not gated.
+            if outcome == "self-probe" and self._awaiting_login():
+                continue
             # Nobody asked for this revival: a self-probe must never open a browser OAuth flow. The
             # OAuth provider runs inside THIS task (the SDK's auth flow sits in the transport), so a
             # task-local ContextVar reaches it; it stays set for the task's life — every later
@@ -535,6 +541,15 @@ class MCPServerRunMixin:
             from tools.mcp_oauth import HermesTokenStorage
             storage = HermesTokenStorage(self.name, hermes_home=get_hermes_home())
             self._auth_park = (storage, storage.credential_stamp())
+
+    def _awaiting_login(self) -> bool:
+        """Auth-parked with no token file and no token/client file rewritten since the park: only
+        `hermes mcp login` (or a Desktop re-auth) can change the outcome. A park that holds tokens
+        (expired refresh, throttled token endpoint) keeps its timed self-probe."""
+        if self._auth_park is None:
+            return False
+        storage, stamp = self._auth_park
+        return not storage.has_cached_tokens() and storage.credential_stamp() == stamp
 
     async def start(self, config: dict):
         """Create the background Task and wait until ready (or failed)."""
