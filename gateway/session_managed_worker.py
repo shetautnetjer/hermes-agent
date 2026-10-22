@@ -160,6 +160,9 @@ class ManagedWorker:
         self.stopped_at = None
         # The gateway restart/shutdown reason when that stop (not a user's) signalled this worker.
         self.stop_cause = None
+        # Why this worker's turn was lost (its outcome left unknown) before it finished, else None: a
+        # restart's after-turn wait reports such a turn as lost, never as drained.
+        self.lost: str | None = None
         self.writer = threading.Thread(target=self._write_controls, name='managed-control-writer', daemon=True)
         # One dedicated reader thread per worker (never the loop's shared default executor, which
         # parked pipe reads would exhaust). It reads one frame per demand, so the pipe keeps its
@@ -662,8 +665,8 @@ async def execute_managed(authority, ref, row, policy):
             raise RuntimeStoreError('invalid_worker_frame')
     except (Exception, asyncio.CancelledError) as exc:
         import logging
-        logging.getLogger(__name__).warning('Managed worker lost: %s',
-            exc.reason if isinstance(exc, RuntimeStoreError) else type(exc).__name__)
+        reason = exc.reason if isinstance(exc, RuntimeStoreError) else type(exc).__name__
+        logging.getLogger(__name__).warning('Managed worker lost: %s', reason)
         if scope is None:
             if isinstance(exc, asyncio.CancelledError) or (
                     isinstance(exc, RuntimeStoreError) and exc.reason == 'managed_worker_stopped'):
@@ -671,6 +674,8 @@ async def execute_managed(authority, ref, row, policy):
                 # this settles like an ordinary interrupted turn (the finally kills the child).
                 return _interrupted_before_bootstrap(authority, row, worker.stop_cause)
             raise
+        # Set before the finally closes the worker, so whoever counted it sees why it ended.
+        worker.lost = reason
         from gateway.session_worker_reservation import lose_admission_worker
         from gateway.session_runtime_workers import tracked_write
         await tracked_write(authority, partial(lose_admission_worker, authority, row, scope))
