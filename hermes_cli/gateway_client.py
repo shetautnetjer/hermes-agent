@@ -102,6 +102,45 @@ class GatewayUnavailableError(GatewayClientError):
         self.state = state
 
 
+# A drain (a restart's after-turn wait, an update's pause, stop()) cuts each interactive socket opened
+# before it, on its next frame, closing it 1013 (Try Again Later) so its client re-dials
+# (``gateway/run_api.py``): a drain cut, not an ordinary end.
+DRAIN_CUT_CLOSE_CODE = 1013
+
+
+class GatewayDisconnectedError(GatewayClientError):
+    """The owner's socket ended under an RPC (or before the next one): a transport loss, never an
+    owner's refusal, so a turn it already admitted may still be running. ``code``/``reason`` are the
+    close frame's when the transport reports one (1006: it ended without one), else ``None``;
+    ``DRAIN_CUT_CLOSE_CODE`` is a restart's drain cut."""
+
+    def __init__(self, code=None, reason=None):
+        self.code = code if isinstance(code, int) and not isinstance(code, bool) else None
+        self.reason = reason if isinstance(reason, str) and reason else None
+        cause = ("" if self.code is None else f" (close {self.code}: drain cut, the owner is draining)"
+                 if self.code == DRAIN_CUT_CLOSE_CODE else f" (close {self.code})")
+        super().__init__(f"Gateway disconnected{cause}; turn outcome is unknown. Resume the printed session ID "
+                         "to check whether it completed or was interrupted; do not resend the work.")
+
+
+def _closed(websocket, exc=None):
+    """``GatewayDisconnectedError`` for *websocket*'s end: its close frame, else the one *exc* names."""
+    code, reason = getattr(websocket, "close_code", None), getattr(websocket, "close_reason", None)
+    frame = getattr(exc, "rcvd", None)
+    if not isinstance(code, int) and frame is not None:
+        code, reason = frame.code, frame.reason
+    return GatewayDisconnectedError(code, reason)
+
+
+class _RunningOwner:
+    def __repr__(self):
+        return "RUNNING_OWNER"
+
+
+# ``connect_gateway(endpoint=RUNNING_OWNER)``: dial the owner that is up now, never start one.
+RUNNING_OWNER = _RunningOwner()
+
+
 class EventQueue(asyncio.Queue):
     """The client's bounded event queue plus an ordered overflow behind it: each ``get`` refills the
     queue from the overflow, so items arrive in read order and ``qsize``/``full`` see only the queue."""
@@ -148,6 +187,8 @@ class GatewayClient:
         self.pending = {}
         self.sequence = 0
         self.reader = None
+        # Set once the reader stops: no later request can be answered on this socket.
+        self.disconnected = None
 
     def _read_on(self):
         """Keep reading past a full queue: nothing is held, or an awaited answer may sit behind the
@@ -180,6 +221,7 @@ class GatewayClient:
 
     async def _read(self):
         from websockets.exceptions import ConnectionClosed
+        ended = None
         try:
             async for raw in self.websocket:
                 frame = json.loads(raw)
@@ -191,11 +233,12 @@ class GatewayClient:
                         future.set_result(frame.get("result", {}))
                 elif "method" in frame:
                     await self._deliver(frame, len(raw))
-        except (ConnectionClosed, OSError, ValueError, TimeoutError):
-            pass
+        except (ConnectionClosed, OSError, ValueError, TimeoutError) as exc:
+            ended = exc
         finally:
-            error = GatewayClientError("Gateway disconnected; turn outcome is unknown. "
-                "Resume the printed session ID to check whether it completed or was interrupted; do not resend the work.")
+            # The close code rides the error (1013: a restart's drain cut), so a caller can tell the
+            # owner going away from an ordinary end.
+            error = self.disconnected = _closed(self.websocket, ended)
             for future in self.pending.values():
                 if not future.done():
                     future.set_exception(error)
@@ -209,13 +252,22 @@ class GatewayClient:
         """Send one request and await its answer; ``_timeout`` (seconds, never sent on the wire)
         overrides ``DEFAULT_RPC_TIMEOUT`` for a verb that legitimately takes longer (``math.inf``: no
         deadline; the answer, a hang-up or the caller's cancel ends the wait)."""
+        from websockets.exceptions import ConnectionClosed
+        if self.disconnected is not None:
+            # The reader has stopped: nothing can answer this request, so fail it now with the close.
+            raise GatewayDisconnectedError(self.disconnected.code, self.disconnected.reason)
         self.sequence += 1
         rid = self.sequence
         future = asyncio.get_running_loop().create_future()
         self.pending[rid] = future
         self.events.moved.set()  # a reader waiting on the consumer reads on toward this answer
         try:
-            await self.websocket.send(json.dumps({"jsonrpc": "2.0", "id": rid, "method": method, "params": params}))
+            try:
+                await self.websocket.send(json.dumps({"jsonrpc": "2.0", "id": rid, "method": method, "params": params}))
+            except ConnectionClosed as exc:
+                # Closed between two requests (stop() closing the socket): the same typed loss, not the
+                # transport library's own exception.
+                raise _closed(self.websocket, exc) from exc
             budget = DEFAULT_RPC_TIMEOUT if _timeout is None else _timeout
             return await asyncio.wait_for(future, None if budget == float("inf") else budget)
         finally:
@@ -261,14 +313,25 @@ def _session_ticket(home: Path, endpoint, *, purpose="interactive", scope=None, 
 @asynccontextmanager
 async def connect_gateway(endpoint=None, subject=None):
     """Attach to this home's owner. ``endpoint``: an already-discovered ready owner to dial as-is
-    (maintenance that must never start a gateway); default ensures one, starting it if needed.
+    (maintenance that must never start a gateway); ``RUNNING_OWNER``: the owner discovery finds up
+    now (ready, or in a restart's after-turn wait), never one this call starts; default ensures one,
+    starting it if needed.
     ``subject``: mint the ticket for this principal (the caller's authenticated dashboard user)
     rather than the socket identity; only a peer the owner already trusts may name one."""
     from websockets.asyncio.client import connect
     from hermes_constants import get_hermes_home
-    from hermes_cli.gateway_runtime import attachable, ensure_gateway_runtime, gateway_profile_home
+    from hermes_cli.gateway_runtime import (
+        attachable, discover_gateway_endpoint, ensure_gateway_runtime, gateway_profile_home,
+    )
     from urllib.parse import urlsplit
 
+    if endpoint is RUNNING_OWNER:
+        # A client whose work an owner already holds re-dials this way: a gateway stopped on purpose
+        # stays stopped, and the client's own tree never becomes an owner.
+        found = await asyncio.to_thread(discover_gateway_endpoint, gateway_profile_home(get_hermes_home()))
+        if not attachable(found):
+            raise GatewayUnavailableError(f"Gateway {found.state}: {found.reason_code or 'not_ready'}", found.state)
+        endpoint = found.endpoint
     remote = "" if endpoint is not None else os.environ.get("HERMES_TUI_GATEWAY_URL", "").strip()
     protocols = None
     if endpoint is not None:

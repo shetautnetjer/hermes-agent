@@ -23,6 +23,13 @@ def uncounted_runtime_work(runner):
             + sum(len(mutation_tasks(authority)) + len(side_agents(authority)) for authority in authorities))
 
 
+def open_managed_workers(runner):
+    """The managed workers still running a turn across every served authority (each ``closed``
+    once its turn ends, with ``lost`` naming the cause when the turn was lost before it finished)."""
+    return [worker for authority in all_authorities(runner)
+            for worker in list(getattr(authority, '_managed_workers', {}).values()) if not worker.closed.is_set()]
+
+
 def side_agents(authority):
     """``(thread, holder)`` for each detached side agent (/bg, /btw, preview restart) whose thread
     has not unwound (``gateway/session_tui_side.py`` ``_spawn``). A stopped ``/btw`` whose fork

@@ -304,19 +304,31 @@ class GatewayRuntimeAPI:
         original_receive = receive
         allow_draining = False
         admitted_in_wait = False
+        cut = False
         from gateway.drain_control import restart_wait_open
 
         async def receive_admitted():
+            nonlocal cut
             message = await original_receive()
             # Only a socket admitted INTO the restart wait (to answer a parked prompt) outlives it. One
             # opened before the wait is cut as before: its client reconnects to the next owner, and a
             # held one (a kanban worker polling its card) would otherwise pin the drain to its cap.
             if ((descriptor['state'] != 'ready' or self.runner._draining) and not allow_draining
                     and not (admitted_in_wait and restart_wait_open(self.runner))):
+                cut = True
                 return {'type': 'websocket.disconnect', 'code': 1013}
             return message
 
-        receive = receive_admitted
+        original_send = send
+
+        async def send_cut(message):
+            # The handler answers the cut with its ordinary close, which on the wire reads as a normal
+            # end (1000): a cut socket closes 1013 (Try Again Later) so its client knows it was a drain.
+            if cut and message.get('type') == 'websocket.close' and message.get('code', 1000) == 1000:
+                message = {**message, 'code': 1013}
+            await original_send(message)
+
+        receive, send = receive_admitted, send_cut
         from starlette.websockets import WebSocket
         from hermes_cli.web_server_boundary import (
             _gateway_ws_ticket_from_subprotocol, ws_client_reason, ws_host_origin_reason,
